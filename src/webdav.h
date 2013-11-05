@@ -22,6 +22,17 @@
 #define DAV_WEBDAV_H
 
 
+/* Constants */
+/*============*/
+#ifdef NE_HAVE_ZLIB
+#define WEBDAV_CONTENT_ENCODING   "content-encoding"
+#define WEBDAV_INFLATE_ENCODING   "gzip"
+#define WEBDAV_INFLATE_UNKNOWN   -1
+#define WEBDAV_NO_INFLATE         0
+#define WEBDAV_INFLATE            1
+#define WEBDAV_INFLATE_CHUNK 524288
+#endif /* NE_HAVE_ZLIB */
+
 /* Data Types */
 /*============*/
 
