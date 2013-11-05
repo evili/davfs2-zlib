@@ -1,0 +1,235 @@
+--- davfs2-1.4.7/configure.ac	2012-07-19 13:38:47.000000000 +0200
++++ davfs2-1.4.7-zlib/configure.ac	2013-10-29 10:50:29.759313923 +0100
+@@ -38,6 +38,7 @@
+ AM_GNU_GETTEXT([external])
+ NE_REQUIRE_VERSIONS([0], [25 26 27 28 29])
+ DAV_CHECK_NEON
++NEON_ZLIB
+ 
+ # Checks for header files.
+ AC_HEADER_DIRENT
+--- davfs2-1.4.7/src/webdav.c	2012-07-19 13:27:51.000000000 +0200
++++ davfs2-1.4.7-zlib/src/webdav.c	2013-10-29 12:09:07.732661858 +0100
+@@ -65,6 +65,9 @@
+ #include <ne_uri.h>
+ #include <ne_utils.h>
+ #include <ne_xml.h>
++#ifdef  NE_HAVE_ZLIB
++#include <zlib.h>
++#endif
+ 
+ #include "defaults.h"
+ #include "mount_davfs.h"
+@@ -91,6 +94,13 @@
+     int error;                  /* An error occured while reading/writing. */
+     const char *file;           /* cache_file to store the data in. */
+     int fd;                     /* file descriptor of the open cache file. */
++#ifdef NE_HAVE_ZLIB
++    int inflate;                /* flag to know if data needs to inflate 
++				   (zlib/gzip) */
++    ne_request  *request;       /* neon request */
++    z_stream *z_strm;           /* ZLIB structure */
++    unsigned char *inflate_out; /* ZLIB buffer */
++#endif
+ } get_context;
+ 
+ typedef struct {
+@@ -268,6 +278,14 @@
+ static int
+ file_reader(void *userdata, const char *block, size_t length);
+ 
++#ifdef  NE_HAVE_ZLIB
++static int
++file_inflate_reader(void *userdata, const char *block, size_t length);
++
++static void
++inflate_cleanup(get_context *ctx);
++#endif /* NE_HAVE_ZLIB */
++
+ #if NE_VERSION_MINOR < 26
+ 
+ static void
+@@ -705,6 +723,12 @@
+     ctx.file = cache_path;
+     ctx.fd = 0;
+ 
++#ifdef NE_HAVE_ZLIB
++    ctx.inflate = WEBDAV_INFLATE_UNKNOWN;
++    ctx.z_strm = NULL;
++    ctx.inflate_out = NULL;
++#endif
++
+     char *spath = ne_path_escape(path);
+     ne_request *req = ne_request_create(session, "GET", spath);
+ 
+@@ -716,6 +740,14 @@
+         ne_add_request_header(req, "If-Modified-Since", mod_time);
+     }
+ 
++#ifdef NE_HAVE_ZLIB
++    if(ne_has_support(NE_FEATURE_ZLIB)) {
++      ne_add_request_header(req, "Accept-Encoding", WEBDAV_INFLATE_ENCODING);
++    }
++
++    ctx.request = req;
++#endif
++
+     ne_add_response_body_reader(req, ne_accept_2xx, file_reader, &ctx);
+ 
+     ret = ne_request_dispatch(req);
+@@ -1612,21 +1644,128 @@
+         ne_set_error(session, _("%i can't open cache file"), 0);
+         ctx->error = EIO;
+     }
+-
+-    while (!ctx->error && length > 0) {
++#ifdef NE_HAVE_ZLIB
++    /* Determine if we need to inflate file */
++    if (ctx->inflate == WEBDAV_INFLATE_UNKNOWN) {
++      const char *cenc = ne_get_response_header(ctx->request, WEBDAV_CONTENT_ENCODING);
++      if((cenc != NULL) && 
++	 strcasestr(cenc, WEBDAV_INFLATE_ENCODING) != NULL) {
++	ctx->inflate = WEBDAV_INFLATE;
++      }
++      else {
++	ctx->inflate = WEBDAV_NO_INFLATE;
++      }
++    }
++
++    /* Call to inflate version of file reader */
++    if(ctx->inflate == WEBDAV_INFLATE) {
++      ctx->error = file_inflate_reader(userdata, block, length);
++    }
++    else {
++#endif /* NE_HAVE_ZLIB */
++      while (!ctx->error && length > 0) {
+         ssize_t ret = write(ctx->fd, block, length);
+         if (ret < 0) {
+-            ctx->error = EIO;
+-            ne_set_error(session, _("%i error writing to cache file"), 0);
++	  ctx->error = EIO;
++	  ne_set_error(session, _("%i error writing to cache file"), 0);
+         } else {
+-            length -= ret;
+-            block += ret;
++	  length -= ret;
++	  block += ret;
+         }
++      }
++#ifdef NE_HAVE_ZLIB
+     }
+-
++#endif
+     return ctx->error;
+ }
+ 
++#ifdef NE_HAVE_ZLIB
++/* Reads HTTP-data from compressed block, inflates, and writes it to a
++   local file.
++   To be called by file_reader().
++ */
++static int
++file_inflate_reader(void *userdata, const char *block, size_t length)
++{
++  int ret, have;
++
++  get_context *ctx = (get_context *) userdata;
++  
++  if (ctx->z_strm == NULL) {
++    ctx->z_strm  = ne_malloc(sizeof(z_stream));
++    ctx->z_strm->zalloc = Z_NULL;
++    ctx->z_strm->zfree = Z_NULL;
++    ctx->z_strm->opaque = Z_NULL;
++    ctx->z_strm->avail_in = 0;
++    ctx->z_strm->next_in = block;
++        
++    ret =  inflateInit2(ctx->z_strm, 15+32);
++
++    if(ret != Z_OK) {
++      syslog(LOG_MAKEPRI(LOG_DAEMON, LOG_ERR), "Zlib error: %s", ctx->z_strm->msg);
++      return ret;
++    }
++    ctx->inflate_out = ne_malloc(sizeof(unsigned char) * WEBDAV_INFLATE_CHUNK);
++  }
++
++  ctx->z_strm->avail_in = length;
++  if (ctx->z_strm->avail_in == 0) {
++    inflate_cleanup(ctx);
++    return 0;
++  }
++
++  ctx->z_strm->next_in = block;
++
++  do {
++    ctx->z_strm->avail_out = WEBDAV_INFLATE_CHUNK;
++    ctx->z_strm->next_out = ctx->inflate_out;
++
++    ret = inflate(ctx->z_strm, Z_NO_FLUSH);
++
++    switch (ret) {
++    case Z_STREAM_ERROR:
++      ret = Z_STREAM_ERROR;
++    case Z_NEED_DICT:
++      ret = Z_DATA_ERROR;
++    case Z_DATA_ERROR:
++    case Z_MEM_ERROR:
++      syslog(LOG_MAKEPRI(LOG_DAEMON, LOG_ERR), "Zlib error: %s", ctx->z_strm->msg);
++      inflate_cleanup(ctx);
++      return ret;
++    }
++
++    have = WEBDAV_INFLATE_CHUNK - ctx->z_strm->avail_out;
++
++    if(have != 0) {
++      ssize_t wrote =  write(ctx->fd, ctx->inflate_out, have);
++      if ( wrote != have || wrote < 0) {
++	syslog(LOG_MAKEPRI(LOG_DAEMON, LOG_ERR), "ERROR writing chunk.");
++	inflate_cleanup(ctx);
++	ne_set_error(session, _("%i error writing to cache file"), 0);
++	return EIO;
++      }
++    }
++  } while(ctx->z_strm->avail_out == 0);
++
++  /* End of stream, we are done */
++  if(ret == Z_STREAM_END) {
++    inflate_cleanup(ctx);
++  }
++
++  return 0;
++}
++
++/* Cleanup the get_context and the zlib structure. */
++static void
++inflate_cleanup(get_context *ctx)
++{
++  (void) inflateEnd(ctx->z_strm);
++  free(ctx->z_strm);
++  free(ctx->inflate_out);
++  ctx->z_strm = NULL;
++  ctx->inflate_out = NULL;
++}
++#endif /* NE_HAVE_ZLIB */
+ 
+ /* If the owner of this lock is the same as global variable owner, lock is
+    stored in the global lock store locks and a pointer to the lock is
+--- davfs2-1.4.7/src/webdav.h	2009-06-04 20:57:48.000000000 +0200
++++ davfs2-1.4.7-zlib/src/webdav.h	2013-10-29 12:08:40.404627119 +0100
+@@ -22,6 +22,17 @@
+ #define DAV_WEBDAV_H
+ 
+ 
++/* Constants */
++/*============*/
++#ifdef NE_HAVE_ZLIB
++#define WEBDAV_CONTENT_ENCODING   "content-encoding"
++#define WEBDAV_INFLATE_ENCODING   "gzip"
++#define WEBDAV_INFLATE_UNKNOWN   -1
++#define WEBDAV_NO_INFLATE         0
++#define WEBDAV_INFLATE            1
++#define WEBDAV_INFLATE_CHUNK 524288
++#endif /* NE_HAVE_ZLIB */
++
+ /* Data Types */
+ /*============*/
+ 
